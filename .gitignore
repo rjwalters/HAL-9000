@@ -1,0 +1,39 @@
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Audio samples (large files)
+hal_samples/
+*.wav
+*.mp3
+*.m4a
+
+# Video files
+*.mkv
+*.mp4
+*.avi
+
+# Logs
+*.log
+
+# Torch cache
+.cache/
