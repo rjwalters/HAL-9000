@@ -34,6 +34,7 @@ hal_samples/
 
 # Logs
 *.log
+transcripts/
 
 # Torch cache
 .cache/

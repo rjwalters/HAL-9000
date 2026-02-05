@@ -19,6 +19,7 @@ from video import VideoCapture
 from services import DeepgramSTT, GroqLLM, ElevenLabsTTS, ClaudeVision
 from hal import ConversationManager
 from hal.personality import get_system_prompt, get_greeting, get_error_response
+from hal.transcript_logger import TranscriptLogger
 from display.server import app, set_state, set_amplitude
 
 # Configure logging
@@ -66,6 +67,9 @@ class HALOrchestrator:
 
         # Conversation management
         self.conversation = ConversationManager()
+
+        # Transcript logging
+        self.transcript = TranscriptLogger()
 
         # Audio buffer for STT
         self._audio_buffer: list[bytes] = []
@@ -188,6 +192,9 @@ class HALOrchestrator:
 
             logger.info(f"Transcript: {transcript}")
 
+            # Log user speech
+            self.transcript.log_user_speech(transcript)
+
             # Update state and generate response
             await self.set_state(config.State.PROCESSING)
 
@@ -253,6 +260,9 @@ class HALOrchestrator:
 
         # Add assistant response to conversation
         self.conversation.add_assistant_message(full_response.strip())
+
+        # Log HAL's response
+        self.transcript.log_hal_response(full_response.strip())
 
     async def _synthesize_and_play(self, text: str) -> None:
         """Synthesize text to speech and play it."""
