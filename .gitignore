@@ -21,16 +21,28 @@ dist/
 *.swo
 .DS_Store
 
-# Audio samples (large files)
-hal_samples/
-*.wav
+# Audio/video source files
 *.mp3
 *.m4a
-
-# Video files
 *.mkv
 *.mp4
 *.avi
+
+# HAL samples - intermediate results
+hal_samples/*.wav
+hal_samples/*.zip
+hal_samples/*.db
+hal_samples/windows/
+hal_samples/finals/
+hal_samples/refined/
+hal_samples/definite/
+hal_samples/review/
+hal_samples/manifest.json
+# hal_samples/srt_candidates/ - keep SRT files
+
+# HAL samples - keep trimmed/ as final output
+!hal_samples/trimmed/
+!hal_samples/trimmed/*.wav
 
 # Logs
 *.log
