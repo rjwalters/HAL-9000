@@ -9,6 +9,8 @@ import time
 from typing import Optional
 
 import anthropic
+import cv2
+import numpy as np
 
 import config
 
@@ -35,6 +37,10 @@ class ClaudeVision:
         self._cache_time: float = 0
         self._cache_lock = asyncio.Lock()
 
+        # Frame differencing
+        self._last_sent_frame: np.ndarray | None = None
+        self._diff_threshold: float = config.VISION_DIFF_THRESHOLD
+
     async def describe_image(
         self,
         image_base64: str,
@@ -59,9 +65,8 @@ class ClaudeVision:
                         {
                             "type": "text",
                             "text": (
-                                "Briefly describe what you see in this image. "
-                                "Focus on people, their actions, expressions, and "
-                                "notable objects or activities. Be concise - 1-2 sentences max."
+                                "In 10 words or fewer, note who is present and "
+                                "what they are doing. No detail about the setting."
                             ),
                         },
                     ],
@@ -94,6 +99,26 @@ class ClaudeVision:
             return time.time() - self._cache_time
         return float("inf")
 
+    def _frame_changed(self, frame_base64: str) -> bool:
+        """Check if the frame differs enough from the last sent frame."""
+        jpeg_bytes = base64.b64decode(frame_base64)
+        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+
+        if self._last_sent_frame is None:
+            self._last_sent_frame = frame
+            return True
+
+        diff = cv2.absdiff(frame, self._last_sent_frame)
+        mean_diff = float(np.mean(diff))
+        logger.debug(f"Frame diff: {mean_diff:.1f} (threshold={self._diff_threshold})")
+
+        if mean_diff >= self._diff_threshold:
+            self._last_sent_frame = frame
+            return True
+
+        return False
+
     async def run_vision_loop(
         self,
         get_frame_func,
@@ -108,7 +133,7 @@ class ClaudeVision:
             interval: Seconds between vision API calls
             stop_event: Event to signal loop should stop
         """
-        logger.info(f"Starting vision loop (interval={interval}s)")
+        logger.info(f"Starting vision loop (interval={interval}s, diff_threshold={self._diff_threshold})")
 
         while not (stop_event and stop_event.is_set()):
             try:
@@ -116,7 +141,10 @@ class ClaudeVision:
                 frame_base64 = await get_frame_func()
 
                 if frame_base64:
-                    await self.update_cache(frame_base64)
+                    if self._frame_changed(frame_base64):
+                        await self.update_cache(frame_base64)
+                    else:
+                        logger.debug("Scene unchanged, skipping vision API call")
                 else:
                     logger.warning("No frame available for vision")
 

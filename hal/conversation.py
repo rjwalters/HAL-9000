@@ -13,12 +13,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Message:
     """A single message in the conversation."""
-    role: str  # "user" or "assistant"
+    role: str  # "user", "assistant", or "vision"
     content: str
     timestamp: datetime = field(default_factory=datetime.now)
+    display_only: bool = False
 
     def to_dict(self) -> dict:
         """Convert to LLM API format."""
+        if self.role == "vision":
+            return {"role": "user", "content": f"[Background visual context — do not describe this aloud, use it to inform your responses] {self.content}"}
         return {"role": self.role, "content": self.content}
 
 
@@ -55,9 +58,23 @@ class ConversationManager:
         self._prune_history()
         logger.debug(f"Added assistant message: {content[:50]}...")
 
+    def add_vision_message(self, content: str) -> None:
+        """Add a vision description to conversation history."""
+        message = Message(role="vision", content=content)
+        self._messages.append(message)
+        self._prune_history()
+        logger.debug(f"Added vision message: {content[:50]}...")
+
     def get_messages(self) -> List[dict]:
         """Get conversation history in LLM API format."""
         return [msg.to_dict() for msg in self._messages]
+
+    def get_messages_with_timestamps(self) -> list[dict]:
+        """Get conversation history with timestamps for display."""
+        return [
+            {"role": msg.role, "content": msg.content, "timestamp": msg.timestamp.strftime("%H:%M:%S")}
+            for msg in self._messages
+        ]
 
     def get_last_user_message(self) -> Optional[str]:
         """Get the most recent user message."""

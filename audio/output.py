@@ -4,7 +4,10 @@ Audio output playback using PyAudio.
 
 import asyncio
 import logging
+import os
+import struct
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -41,6 +44,15 @@ class AudioOutput:
         # Current amplitude for visualization
         self._current_amplitude = 0.0
         self._amplitude_lock = threading.Lock()
+
+        # Fade-in state to avoid click on speech start
+        self._needs_fadein = True
+        self._fadein_samples = 256  # ~10ms at 24kHz
+
+        # Debug audio dump
+        self._debug_chunks: list[bytes] = []
+        if config.DEBUG_SAVE_AUDIO:
+            os.makedirs(config.DEBUG_AUDIO_DIR, exist_ok=True)
 
     def start(self) -> None:
         """Start audio playback."""
@@ -135,10 +147,62 @@ class AudioOutput:
             # Smooth amplitude changes
             self._current_amplitude = 0.7 * amplitude + 0.3 * self._current_amplitude
 
+    def _apply_fadein(self, data: bytes) -> bytes:
+        """Apply a short linear fade-in to avoid click artifacts."""
+        audio = np.frombuffer(data, dtype=np.int16).copy()
+        n = min(self._fadein_samples, len(audio))
+        ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        audio[:n] = (audio[:n].astype(np.float32) * ramp).astype(np.int16)
+        return audio.tobytes()
+
+    def _save_debug_wav(self) -> None:
+        """Save accumulated debug chunks as a timestamped WAV file."""
+        if not self._debug_chunks:
+            return
+
+        pcm_data = b"".join(self._debug_chunks)
+        self._debug_chunks.clear()
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(config.DEBUG_AUDIO_DIR, f"tts_{timestamp}.wav")
+
+        # Write WAV file manually (avoid extra dependency)
+        num_frames = len(pcm_data) // (self.channels * 2)
+        byte_rate = self.sample_rate * self.channels * 2
+        block_align = self.channels * 2
+        data_size = len(pcm_data)
+
+        with open(path, "wb") as f:
+            # RIFF header
+            f.write(b"RIFF")
+            f.write(struct.pack("<I", 36 + data_size))
+            f.write(b"WAVE")
+            # fmt chunk
+            f.write(b"fmt ")
+            f.write(struct.pack("<I", 16))  # chunk size
+            f.write(struct.pack("<H", 1))   # PCM format
+            f.write(struct.pack("<H", self.channels))
+            f.write(struct.pack("<I", self.sample_rate))
+            f.write(struct.pack("<I", byte_rate))
+            f.write(struct.pack("<H", block_align))
+            f.write(struct.pack("<H", 16))  # bits per sample
+            # data chunk
+            f.write(b"data")
+            f.write(struct.pack("<I", data_size))
+            f.write(pcm_data)
+
+        logger.info(f"Debug audio saved: {path} ({num_frames} frames, {num_frames / self.sample_rate:.2f}s)")
+
     def write(self, data: bytes) -> None:
         """Write audio data to playback buffer."""
         with self._buffer_lock:
+            if self._needs_fadein:
+                data = self._apply_fadein(data)
+                self._needs_fadein = False
             self._buffer.append(data)
+
+        if config.DEBUG_SAVE_AUDIO:
+            self._debug_chunks.append(data)
 
     async def write_async(self, data: bytes) -> None:
         """Async write to playback buffer."""
@@ -146,8 +210,12 @@ class AudioOutput:
 
     def clear_buffer(self) -> None:
         """Clear the playback buffer."""
+        if config.DEBUG_SAVE_AUDIO:
+            self._save_debug_wav()
+
         with self._buffer_lock:
             self._buffer.clear()
+            self._needs_fadein = True
         with self._amplitude_lock:
             self._current_amplitude = 0.0
 

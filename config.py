@@ -44,8 +44,9 @@ VIDEO_DEVICE_ID = 0  # Default webcam
 VIDEO_FRAME_WIDTH = 640
 VIDEO_FRAME_HEIGHT = 480
 VIDEO_FPS = 30
-VISION_CAPTURE_INTERVAL = 2.0  # Seconds between vision API calls
+VISION_CAPTURE_INTERVAL = 15.0  # Seconds between vision API calls
 VISION_JPEG_QUALITY = 85  # JPEG compression quality (0-100)
+VISION_DIFF_THRESHOLD = 5.0  # Mean pixel difference (0-255) to trigger a new API call
 
 # =============================================================================
 # Deepgram STT Configuration
@@ -77,6 +78,12 @@ ELEVENLABS_OPTIMIZE_LATENCY = 4  # Maximum latency optimization
 # =============================================================================
 VISION_MODEL = "claude-sonnet-4-20250514"  # Fast vision model
 VISION_MAX_TOKENS = 150  # Brief scene descriptions
+
+# =============================================================================
+# Debug Audio Configuration
+# =============================================================================
+DEBUG_SAVE_AUDIO = True  # Save TTS audio to disk for debugging
+DEBUG_AUDIO_DIR = "debug_audio"  # Directory for debug WAV files
 
 # =============================================================================
 # HAL Eye Display Configuration
