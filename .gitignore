@@ -44,6 +44,10 @@ hal_samples/manifest.json
 !hal_samples/trimmed/
 !hal_samples/trimmed/*.wav
 
+# Narration isolation intermediates
+hal_samples/separated/
+hal_samples/narration_clips/
+
 # Logs
 *.log
 transcripts/

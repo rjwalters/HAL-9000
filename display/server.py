@@ -5,6 +5,7 @@ FastAPI server for HAL-9000 eye display webapp.
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Set
 
@@ -34,6 +35,12 @@ class DisplayState:
         self.amplitude: float = 0.0
         self.connected_clients: Set[WebSocket] = set()
         self._lock = asyncio.Lock()
+        self._orchestrator = None
+        self._start_time = time.time()
+
+    def set_orchestrator(self, orchestrator) -> None:
+        """Store a reference to the orchestrator for stats."""
+        self._orchestrator = orchestrator
 
     async def update_state(self, new_state: str) -> None:
         """Update the current state and broadcast to clients."""
@@ -57,6 +64,14 @@ class DisplayState:
                 "state": self.state,
                 "amplitude": self.amplitude,
             })
+            # Send initial conversation snapshot and stats
+            if self._orchestrator:
+                messages = self._orchestrator.conversation.get_messages_with_timestamps()
+                await websocket.send_json({
+                    "type": "conversation",
+                    "messages": messages,
+                })
+            await websocket.send_json(self._build_stats())
         logger.info(f"Display client connected. Total: {len(self.connected_clients)}")
 
     async def disconnect(self, websocket: WebSocket) -> None:
@@ -84,6 +99,59 @@ class DisplayState:
 
         # Clean up disconnected clients
         self.connected_clients -= disconnected
+
+    async def _broadcast_json(self, message: dict) -> None:
+        """Broadcast a JSON message to all connected clients."""
+        if not self.connected_clients:
+            return
+
+        text = json.dumps(message)
+        disconnected = set()
+        for client in self.connected_clients:
+            try:
+                await client.send_text(text)
+            except Exception:
+                disconnected.add(client)
+        self.connected_clients -= disconnected
+
+    async def broadcast_conversation(self) -> None:
+        """Send full conversation history to all clients."""
+        if not self._orchestrator:
+            return
+        messages = self._orchestrator.conversation.get_messages_with_timestamps()
+        async with self._lock:
+            await self._broadcast_json({
+                "type": "conversation",
+                "messages": messages,
+            })
+
+    async def start_stats_loop(self) -> None:
+        """Broadcast stats to all clients every 2 seconds."""
+        while True:
+            await asyncio.sleep(2)
+            if not self.connected_clients:
+                continue
+            stats = self._build_stats()
+            async with self._lock:
+                await self._broadcast_json(stats)
+
+    def _build_stats(self) -> dict:
+        """Build the stats payload."""
+        vision_cache_age = None
+        message_count = 0
+        if self._orchestrator:
+            age = self._orchestrator.vision.get_cache_age()
+            vision_cache_age = None if age == float("inf") else round(age, 1)
+            message_count = self._orchestrator.conversation.message_count
+
+        return {
+            "type": "stats",
+            "state": self.state,
+            "connected_clients": len(self.connected_clients),
+            "message_count": message_count,
+            "vision_cache_age": vision_cache_age,
+            "uptime": round(time.time() - self._start_time, 1),
+        }
 
 
 # Global display state
@@ -138,6 +206,11 @@ async def set_state(state: str) -> None:
 async def set_amplitude(amplitude: float) -> None:
     """Set the audio amplitude (called from orchestrator)."""
     await display_state.update_amplitude(amplitude)
+
+
+async def broadcast_conversation() -> None:
+    """Broadcast conversation history (called from orchestrator)."""
+    await display_state.broadcast_conversation()
 
 
 def get_app() -> FastAPI:

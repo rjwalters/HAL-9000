@@ -20,7 +20,7 @@ from services import DeepgramSTT, GroqLLM, ElevenLabsTTS, ClaudeVision
 from hal import ConversationManager
 from hal.personality import get_system_prompt, get_greeting, get_error_response
 from hal.transcript_logger import TranscriptLogger
-from display.server import app, set_state, set_amplitude
+from display.server import app, display_state, set_state, set_amplitude, broadcast_conversation
 
 # Configure logging
 logging.basicConfig(
@@ -99,6 +99,9 @@ class HALOrchestrator:
         # Store event loop reference for thread callbacks
         self._loop = asyncio.get_running_loop()
 
+        # Wire orchestrator to display for stats/conversation
+        display_state.set_orchestrator(self)
+
         # Start hardware components
         self.audio_input.start()
         self.audio_output.start()
@@ -125,6 +128,7 @@ class HALOrchestrator:
         await asyncio.gather(
             self._vision_loop(),
             self._amplitude_loop(),
+            display_state.start_stats_loop(),
             self._wait_for_stop(),
         )
 
@@ -200,6 +204,7 @@ class HALOrchestrator:
 
             # Add user message to conversation
             self.conversation.add_user_message(transcript)
+            await broadcast_conversation()
 
             # Generate and speak response
             await self._generate_and_speak(transcript)
@@ -216,6 +221,7 @@ class HALOrchestrator:
     async def _transcribe_speech(self) -> str:
         """Transcribe buffered speech using Deepgram."""
         await self.stt.connect()
+        self.stt.clear_transcript()
 
         try:
             # Send buffered audio
@@ -242,12 +248,15 @@ class HALOrchestrator:
         """Generate LLM response and synthesize speech with streaming."""
         await self.set_state(config.State.SPEAKING)
 
-        # Get current visual context
+        # Add current visual context as a conversation message
         scene_description = self.vision.get_cached_description()
-        system_prompt = get_system_prompt(scene_description)
+        if scene_description and scene_description != "No visual information available.":
+            self.conversation.add_vision_message(scene_description)
+            await broadcast_conversation()
 
-        # Get conversation history
+        # Get conversation history and system prompt
         messages = self.conversation.get_messages()
+        system_prompt = get_system_prompt()
 
         # Stream response sentence by sentence
         full_response = ""
@@ -260,6 +269,7 @@ class HALOrchestrator:
 
         # Add assistant response to conversation
         self.conversation.add_assistant_message(full_response.strip())
+        await broadcast_conversation()
 
         # Log HAL's response
         self.transcript.log_hal_response(full_response.strip())

@@ -16,6 +16,9 @@ class HALEye {
         this.currentAmplitude = 0;
         this.targetAmplitude = 0;
 
+        // Conversation pane reference
+        this.conversationPane = null;
+
         // Animation frame ID for cleanup
         this.animationFrame = null;
 
@@ -39,6 +42,7 @@ class HALEye {
             console.log('Connected to HAL server');
             this.connectionStatus.classList.add('connected');
             this.reconnectDelay = 1000; // Reset delay on successful connection
+            if (this.conversationPane) this.conversationPane.setConnected(true);
         };
 
         this.ws.onmessage = (event) => {
@@ -56,6 +60,7 @@ class HALEye {
         this.ws.onclose = () => {
             console.log('Disconnected from HAL server');
             this.connectionStatus.classList.remove('connected');
+            if (this.conversationPane) this.conversationPane.setConnected(false);
             this.scheduleReconnect();
         };
 
@@ -85,11 +90,19 @@ class HALEye {
     }
 
     handleMessage(data) {
-        if (data.state !== undefined) {
-            this.setState(data.state);
+        // Forward all messages to conversation pane
+        if (this.conversationPane) {
+            this.conversationPane.handleMessage(data);
         }
-        if (data.amplitude !== undefined) {
-            this.targetAmplitude = data.amplitude;
+
+        // Only process eye state/amplitude for messages without a type field
+        if (!data.type) {
+            if (data.state !== undefined) {
+                this.setState(data.state);
+            }
+            if (data.amplitude !== undefined) {
+                this.targetAmplitude = data.amplitude;
+            }
         }
     }
 
@@ -165,6 +178,8 @@ class HALEye {
 // Initialize when DOM is ready
 document.addEventListener('DOMContentLoaded', () => {
     window.halEye = new HALEye();
+    window.halPane = new ConversationPane();
+    window.halEye.conversationPane = window.halPane;
 });
 
 // Cleanup on page unload
