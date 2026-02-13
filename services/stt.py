@@ -37,6 +37,9 @@ class DeepgramSTT:
         self._transcript_buffer: list[str] = []
         self._final_transcript: str = ""
 
+        # Utterance end event — set when Deepgram detects end of speech
+        self._utterance_end_event: asyncio.Event | None = None
+
         # Callbacks
         self._on_transcript: Callable[[str, bool], None] | None = None
 
@@ -138,7 +141,9 @@ class DeepgramSTT:
             logger.debug(f"Deepgram metadata: {data}")
 
         elif msg_type == "UtteranceEnd":
-            logger.debug("Utterance end detected")
+            logger.info("Deepgram utterance end detected")
+            if self._utterance_end_event:
+                self._utterance_end_event.set()
 
         elif msg_type == "SpeechStarted":
             logger.debug("Speech started")
@@ -160,9 +165,17 @@ class DeepgramSTT:
         return self._final_transcript
 
     def clear_transcript(self) -> None:
-        """Clear the transcript buffer."""
+        """Clear the transcript buffer and reset utterance end event."""
         self._transcript_buffer.clear()
         self._final_transcript = ""
+        self._utterance_end_event = asyncio.Event()
+
+    @property
+    def utterance_end_event(self) -> asyncio.Event:
+        """Event that is set when Deepgram detects end of utterance."""
+        if self._utterance_end_event is None:
+            self._utterance_end_event = asyncio.Event()
+        return self._utterance_end_event
 
     async def transcribe_stream(
         self,

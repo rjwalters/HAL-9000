@@ -228,14 +228,27 @@ class HALOrchestrator:
             for chunk in self._audio_buffer:
                 await self.stt.send_audio(chunk)
 
-            # Continue sending until speech ends
-            while not self._speech_end_event.is_set():
+            # Continue sending audio until Deepgram detects utterance end,
+            # VAD detects silence, or we hit the max recording duration
+            utterance_end = self.stt.utterance_end_event
+            deadline = asyncio.get_event_loop().time() + config.VAD_MAX_RECORDING_SECS
+
+            while not utterance_end.is_set() and not self._speech_end_event.is_set():
+                if asyncio.get_event_loop().time() >= deadline:
+                    logger.warning("Max recording duration reached, cutting off")
+                    break
+
                 await asyncio.sleep(0.01)
 
                 # Send any new audio that arrived
                 while self._audio_buffer:
                     chunk = self._audio_buffer.pop(0)
                     await self.stt.send_audio(chunk)
+
+            if utterance_end.is_set():
+                logger.info("Speech ended (Deepgram utterance end)")
+            elif self._speech_end_event.is_set():
+                logger.info("Speech ended (VAD silence)")
 
             # Wait for final transcript
             await asyncio.sleep(0.3)

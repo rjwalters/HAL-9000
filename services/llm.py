@@ -31,6 +31,39 @@ class GroqLLM:
 
         self._client = AsyncGroq(api_key=self.api_key)
 
+    async def is_directed_at_hal(
+        self,
+        transcript: str,
+        recent_context: str = "",
+    ) -> bool:
+        """Quick classification: is this speech directed at HAL or background noise?"""
+        prompt = (
+            "You are a speech intent classifier for HAL 9000, a voice assistant at a dinner party. "
+            "People in the room may talk to each other or to HAL. "
+            "Determine if the following transcript is directed at HAL or is meaningful input HAL should respond to.\n\n"
+            "Answer ONLY 'yes' or 'no'. When in doubt, say 'yes'.\n"
+            "- 'yes' if the speaker is talking to HAL, asking a question, making a statement, "
+            "continuing a conversation with HAL, or saying anything HAL could reasonably respond to\n"
+            "- 'no' ONLY if it's clearly noise artifacts, meaningless fragments (1-2 garbled words), "
+            "or an obvious side conversation between other people that has nothing to do with HAL\n"
+        )
+        if recent_context:
+            prompt += f"\nRecent conversation with HAL:\n{recent_context}\n"
+        prompt += f"\nTranscript: \"{transcript}\"\n\nDirected at HAL?"
+
+        try:
+            response = await self._client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=3,
+                temperature=0,
+            )
+            answer = response.choices[0].message.content.strip().lower()
+            return answer.startswith("yes")
+        except Exception as e:
+            logger.warning(f"Intent classification failed: {e}")
+            return True  # fail open — respond if unsure
+
     async def generate(
         self,
         messages: list[dict],
