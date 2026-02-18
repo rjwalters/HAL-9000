@@ -34,7 +34,7 @@ PLAYBACK_CHUNK_SIZE = 1024
 # =============================================================================
 VAD_THRESHOLD = 0.5  # Speech probability threshold (0-1)
 VAD_MIN_SPEECH_MS = 250  # Minimum speech duration to trigger
-VAD_MIN_SILENCE_MS = 700  # Silence duration to mark end-of-speech
+VAD_MIN_SILENCE_MS = 500  # Silence duration to mark end-of-speech
 VAD_WINDOW_SIZE_MS = 32  # VAD analysis window
 VAD_MAX_RECORDING_SECS = 60  # Hard cap on recording duration
 

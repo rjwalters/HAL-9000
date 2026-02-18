@@ -78,6 +78,9 @@ class HALOrchestrator:
         # Speech event
         self._speech_end_event = asyncio.Event()
 
+        # Barge-in event — set when user speaks during HAL's response
+        self._barge_in_event = asyncio.Event()
+
         # Event loop reference for thread-safe callbacks
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -153,8 +156,10 @@ class HALOrchestrator:
         # Process through VAD
         self.vad.process_audio(audio_bytes)
 
-        # Buffer audio when listening
-        if self._state in (config.State.IDLE, config.State.LISTENING):
+        # Buffer audio when listening, or during SPEAKING after barge-in
+        if self._state in (config.State.IDLE, config.State.LISTENING) or (
+            self._state == config.State.SPEAKING and self._barge_in_event.is_set()
+        ):
             # Use thread-safe approach
             self._loop.call_soon_threadsafe(
                 lambda b=audio_bytes: self._audio_buffer.append(b)
@@ -167,6 +172,10 @@ class HALOrchestrator:
             self._loop.call_soon_threadsafe(
                 lambda: asyncio.create_task(self._handle_speech_start())
             )
+        elif self._state == config.State.SPEAKING and self._loop:
+            logger.info("Barge-in detected during speech")
+            self._loop.call_soon_threadsafe(self._barge_in_event.set)
+            self._loop.call_soon_threadsafe(self._audio_buffer.clear)
 
     def _on_speech_end(self) -> None:
         """Called when VAD detects end of speech."""
@@ -184,30 +193,47 @@ class HALOrchestrator:
         asyncio.create_task(self._process_speech())
 
     async def _process_speech(self) -> None:
-        """Process user speech through the full pipeline."""
+        """Process user speech through the full pipeline.
+
+        Uses a loop to support barge-in: when the user interrupts HAL's
+        response, we re-enter transcription with the buffered barge-in
+        audio instead of returning to idle.
+        """
         try:
-            # Wait for end of speech and transcribe
-            transcript = await self._transcribe_speech()
+            while True:
+                # Wait for end of speech and transcribe
+                transcript = await self._transcribe_speech()
 
-            if not transcript or len(transcript.strip()) < 2:
-                logger.info("No speech detected, returning to idle")
-                await self.set_state(config.State.IDLE)
-                return
+                if not transcript or len(transcript.strip()) < 2:
+                    logger.info("No speech detected, returning to idle")
+                    break
 
-            logger.info(f"Transcript: {transcript}")
+                logger.info(f"Transcript: {transcript}")
 
-            # Log user speech
-            self.transcript.log_user_speech(transcript)
+                # Log user speech
+                self.transcript.log_user_speech(transcript)
 
-            # Update state and generate response
-            await self.set_state(config.State.PROCESSING)
+                # Update state and generate response
+                await self.set_state(config.State.PROCESSING)
 
-            # Add user message to conversation
-            self.conversation.add_user_message(transcript)
-            await broadcast_conversation()
+                # Add user message to conversation
+                self.conversation.add_user_message(transcript)
+                await broadcast_conversation()
 
-            # Generate and speak response
-            await self._generate_and_speak(transcript)
+                # Generate and speak response
+                self._barge_in_event.clear()
+                await self._generate_and_speak(transcript)
+
+                # If barge-in occurred, loop back to transcribe the interruption
+                if self._barge_in_event.is_set():
+                    logger.info("Processing barge-in speech")
+                    self._barge_in_event.clear()
+                    self.vad.reset()
+                    self._speech_end_event.clear()
+                    await self.set_state(config.State.LISTENING)
+                    continue
+
+                break
 
         except Exception as e:
             logger.error(f"Error processing speech: {e}", exc_info=True)
@@ -251,14 +277,22 @@ class HALOrchestrator:
                 logger.info("Speech ended (VAD silence)")
 
             # Wait for final transcript
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
             return self.stt.get_final_transcript()
 
         finally:
             await self.stt.disconnect()
 
     async def _generate_and_speak(self, user_input: str) -> None:
-        """Generate LLM response and synthesize speech with streaming."""
+        """Generate LLM response and synthesize speech with pipelined TTS.
+
+        Uses a producer/consumer pattern: the LLM streams sentences into an
+        asyncio.Queue while the consumer streams TTS audio chunks to the
+        output buffer.  This eliminates inter-sentence silence gaps.
+
+        Supports barge-in: both producer and consumer check _barge_in_event
+        each iteration and bail out early when set.
+        """
         await self.set_state(config.State.SPEAKING)
 
         # Add current visual context as a conversation message
@@ -271,21 +305,70 @@ class HALOrchestrator:
         messages = self.conversation.get_messages()
         system_prompt = get_system_prompt()
 
-        # Stream response sentence by sentence
-        full_response = ""
+        # Pipeline TTS — producer/consumer via asyncio.Queue
+        sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        spoken_sentences: list[str] = []
 
-        async for sentence in self.llm.generate_sentences(messages, system_prompt):
-            full_response += sentence + " "
+        async def producer():
+            try:
+                async for sentence in self.llm.generate_sentences(messages, system_prompt):
+                    if self._barge_in_event.is_set():
+                        break
+                    await sentence_queue.put(sentence)
+            finally:
+                await sentence_queue.put(None)  # sentinel
 
-            # Synthesize and play this sentence
-            await self._synthesize_and_play(sentence)
+        async def consumer():
+            while not self._barge_in_event.is_set():
+                # Poll queue with timeout so we can check barge-in
+                try:
+                    sentence = await asyncio.wait_for(
+                        sentence_queue.get(), timeout=0.1
+                    )
+                except asyncio.TimeoutError:
+                    continue
 
-        # Add assistant response to conversation
-        self.conversation.add_assistant_message(full_response.strip())
-        await broadcast_conversation()
+                if sentence is None:
+                    break
 
-        # Log HAL's response
-        self.transcript.log_hal_response(full_response.strip())
+                spoken_sentences.append(sentence)
+
+                try:
+                    async for audio_chunk in self.tts.synthesize_stream(sentence):
+                        if self._barge_in_event.is_set():
+                            break
+                        self.audio_output.write(audio_chunk)
+                except Exception as e:
+                    logger.error(f"TTS error: {e}")
+
+            # Wait for playback to drain (unless barged-in)
+            while self.audio_output.is_playing() and not self._barge_in_event.is_set():
+                await asyncio.sleep(0.05)
+
+        # Run producer and consumer concurrently
+        producer_task = asyncio.create_task(producer())
+        await consumer()
+
+        # Ensure producer is cleaned up
+        if not producer_task.done():
+            producer_task.cancel()
+            try:
+                await producer_task
+            except asyncio.CancelledError:
+                pass
+        else:
+            await producer_task  # propagate exceptions
+
+        # On barge-in, immediately silence HAL
+        if self._barge_in_event.is_set():
+            self.audio_output.clear_buffer()
+
+        # Record whatever was spoken
+        full_response = " ".join(spoken_sentences)
+        if full_response:
+            self.conversation.add_assistant_message(full_response.strip())
+            await broadcast_conversation()
+            self.transcript.log_hal_response(full_response.strip())
 
     async def _synthesize_and_play(self, text: str) -> None:
         """Synthesize text to speech and play it."""

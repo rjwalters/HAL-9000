@@ -54,7 +54,7 @@ class DeepgramSTT:
             f"smart_format={str(config.DEEPGRAM_SMART_FORMAT).lower()}",
             f"interim_results={str(config.DEEPGRAM_INTERIM_RESULTS).lower()}",
             f"endpointing=300",
-            f"utterance_end_ms=1000",
+            f"utterance_end_ms=750",
         ]
         return f"{DEEPGRAM_WS_URL}?{'&'.join(params)}"
 
