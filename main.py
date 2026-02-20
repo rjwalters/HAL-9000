@@ -6,9 +6,15 @@ voice assistant with HAL-9000 personality.
 """
 
 import asyncio
+import json
 import logging
+import os
+import random
+import re
 import signal
+import struct
 import sys
+import time
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -18,7 +24,7 @@ from audio import AudioInput, AudioOutput, VoiceActivityDetector
 from video import VideoCapture
 from services import DeepgramSTT, GroqLLM, ElevenLabsTTS, ClaudeVision
 from hal import ConversationManager
-from hal.personality import get_system_prompt, get_greeting, get_error_response
+from hal.personality import get_system_prompt, get_greeting, get_error_response, get_proactive_prompt
 from hal.transcript_logger import TranscriptLogger
 from display.server import app, display_state, set_state, set_amplitude, broadcast_conversation
 
@@ -28,6 +34,45 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+_PERSON_WORDS = re.compile(
+    r"\b(person|man|woman|people|someone|individual|figure|guest|he|she|they)\b",
+    re.IGNORECASE,
+)
+
+
+def _description_has_person(description: str) -> bool:
+    """Check if a vision description mentions a person."""
+    return bool(_PERSON_WORDS.search(description))
+
+
+def _parse_questions(response: str) -> list[str]:
+    """Parse a list of questions from an LLM response.
+
+    Tries JSON first, falls back to line-by-line parsing.
+    """
+    # Try JSON array
+    try:
+        parsed = json.loads(response)
+        if isinstance(parsed, list) and all(isinstance(q, str) for q in parsed):
+            return [q.strip() for q in parsed if q.strip()]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Fallback: split on newlines and strip numbering
+    questions = []
+    for line in response.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Strip leading numbering like "1.", "2)", "- ", "* "
+        line = re.sub(r"^[\d]+[.)]\s*", "", line)
+        line = re.sub(r"^[-*]\s*", "", line)
+        line = line.strip().strip('"').strip("'")
+        if line:
+            questions.append(line)
+    return questions
 
 
 class HALOrchestrator:
@@ -51,8 +96,8 @@ class HALOrchestrator:
         self._stop_event = asyncio.Event()
 
         # Audio components
-        self.audio_input = AudioInput()
-        self.audio_output = AudioOutput()
+        self.audio_input = AudioInput(device_index=config.AUDIO_INPUT_DEVICE)
+        self.audio_output = AudioOutput(device_index=config.PLAYBACK_OUTPUT_DEVICE)
         self.vad = VoiceActivityDetector()
 
         # Video component (optional)
@@ -78,11 +123,18 @@ class HALOrchestrator:
         # Speech event
         self._speech_end_event = asyncio.Event()
 
-        # Barge-in event — set when user speaks during HAL's response
-        self._barge_in_event = asyncio.Event()
-
         # Event loop reference for thread-safe callbacks
         self._loop: asyncio.AbstractEventLoop | None = None
+
+        # Timestamp when speaking ended (for echo cooldown)
+        self._speaking_ended_at: float = 0.0
+
+        # Debug STT audio counter
+        self._stt_attempt: int = 0
+
+        # Proactive conversation tracking
+        self._person_frames: int = 0
+        self._last_proactive_at: float = 0.0
 
     @property
     def state(self) -> str:
@@ -153,13 +205,16 @@ class HALOrchestrator:
         if not self._running or not self._loop:
             return
 
-        # Process through VAD
-        self.vad.process_audio(audio_bytes)
+        # Skip VAD while SPEAKING and during echo cooldown after speaking
+        if self._state == config.State.SPEAKING:
+            pass  # Never run VAD during speech output
+        elif time.time() - self._speaking_ended_at < 0.6:
+            pass  # Echo cooldown — suppress VAD for 600ms after speaking ends
+        else:
+            self.vad.process_audio(audio_bytes)
 
-        # Buffer audio when listening, or during SPEAKING after barge-in
-        if self._state in (config.State.IDLE, config.State.LISTENING) or (
-            self._state == config.State.SPEAKING and self._barge_in_event.is_set()
-        ):
+        # Buffer audio when listening
+        if self._state in (config.State.IDLE, config.State.LISTENING):
             # Use thread-safe approach
             self._loop.call_soon_threadsafe(
                 lambda b=audio_bytes: self._audio_buffer.append(b)
@@ -172,10 +227,6 @@ class HALOrchestrator:
             self._loop.call_soon_threadsafe(
                 lambda: asyncio.create_task(self._handle_speech_start())
             )
-        elif self._state == config.State.SPEAKING and self._loop:
-            logger.info("Barge-in detected during speech")
-            self._loop.call_soon_threadsafe(self._barge_in_event.set)
-            self._loop.call_soon_threadsafe(self._audio_buffer.clear)
 
     def _on_speech_end(self) -> None:
         """Called when VAD detects end of speech."""
@@ -193,66 +244,62 @@ class HALOrchestrator:
         asyncio.create_task(self._process_speech())
 
     async def _process_speech(self) -> None:
-        """Process user speech through the full pipeline.
-
-        Uses a loop to support barge-in: when the user interrupts HAL's
-        response, we re-enter transcription with the buffered barge-in
-        audio instead of returning to idle.
-        """
+        """Process user speech through the full pipeline."""
         try:
-            while True:
-                # Wait for end of speech and transcribe
-                transcript = await self._transcribe_speech()
+            # Wait for end of speech and transcribe
+            transcript = await self._transcribe_speech()
 
-                if not transcript or len(transcript.strip()) < 2:
-                    logger.info("No speech detected, returning to idle")
-                    break
+            if not transcript or len(transcript.strip()) < 2:
+                logger.info("No speech detected, returning to idle")
+                await self.set_state(config.State.IDLE)
+                return
 
-                logger.info(f"Transcript: {transcript}")
+            logger.info(f"Transcript: {transcript}")
 
-                # Log user speech
-                self.transcript.log_user_speech(transcript)
+            # Log user speech
+            self.transcript.log_user_speech(transcript)
 
-                # Update state and generate response
-                await self.set_state(config.State.PROCESSING)
+            # Update state and generate response
+            await self.set_state(config.State.PROCESSING)
 
-                # Add user message to conversation
-                self.conversation.add_user_message(transcript)
-                await broadcast_conversation()
+            # Add user message to conversation
+            self.conversation.add_user_message(transcript)
+            await broadcast_conversation()
 
-                # Generate and speak response
-                self._barge_in_event.clear()
-                await self._generate_and_speak(transcript)
-
-                # If barge-in occurred, loop back to transcribe the interruption
-                if self._barge_in_event.is_set():
-                    logger.info("Processing barge-in speech")
-                    self._barge_in_event.clear()
-                    self.vad.reset()
-                    self._speech_end_event.clear()
-                    await self.set_state(config.State.LISTENING)
-                    continue
-
-                break
+            # Generate and speak response
+            await self._generate_and_speak(transcript)
 
         except Exception as e:
             logger.error(f"Error processing speech: {e}", exc_info=True)
             await self._speak(get_error_response())
 
         finally:
+            # Mark when speaking ended so echo cooldown kicks in
+            if self._state == config.State.SPEAKING:
+                self._speaking_ended_at = time.time()
             # Reset VAD and return to idle
             self.vad.reset()
             await self.set_state(config.State.IDLE)
 
     async def _transcribe_speech(self) -> str:
         """Transcribe buffered speech using Deepgram."""
+        self._stt_attempt += 1
+        attempt = self._stt_attempt
+        debug_chunks: list[bytes] = []
+
         await self.stt.connect()
         self.stt.clear_transcript()
 
         try:
-            # Send buffered audio
-            for chunk in self._audio_buffer:
+            # Send buffered audio (drain to avoid double-send on next loop)
+            chunks_sent = 0
+            while self._audio_buffer:
+                chunk = self._audio_buffer.pop(0)
                 await self.stt.send_audio(chunk)
+                debug_chunks.append(chunk)
+                chunks_sent += 1
+
+            logger.info(f"STT attempt #{attempt}: sent {chunks_sent} buffered chunks")
 
             # Continue sending audio until Deepgram detects utterance end,
             # VAD detects silence, or we hit the max recording duration
@@ -270,105 +317,108 @@ class HALOrchestrator:
                 while self._audio_buffer:
                     chunk = self._audio_buffer.pop(0)
                     await self.stt.send_audio(chunk)
+                    debug_chunks.append(chunk)
+                    chunks_sent += 1
 
             if utterance_end.is_set():
                 logger.info("Speech ended (Deepgram utterance end)")
             elif self._speech_end_event.is_set():
                 logger.info("Speech ended (VAD silence)")
 
-            # Wait for final transcript
-            await asyncio.sleep(0.1)
-            return self.stt.get_final_transcript()
+            # Flush any remaining buffered audio after speech end
+            while self._audio_buffer:
+                chunk = self._audio_buffer.pop(0)
+                await self.stt.send_audio(chunk)
+                debug_chunks.append(chunk)
+                chunks_sent += 1
+
+            logger.info(f"STT attempt #{attempt}: total {chunks_sent} chunks sent")
+
+            # Save debug audio
+            if config.DEBUG_SAVE_AUDIO and debug_chunks:
+                self._save_stt_debug_audio(attempt, debug_chunks)
+
+            # Signal Deepgram to finalize and flush any pending results
+            await self.stt.finalize()
+
+            # Wait for final transcript (up to 1.5s, or until we get one)
+            wait_start = asyncio.get_event_loop().time()
+            while asyncio.get_event_loop().time() - wait_start < 1.5:
+                transcript = self.stt.get_final_transcript()
+                if transcript:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                transcript = self.stt.get_final_transcript()
+
+            logger.info(f"STT attempt #{attempt}: transcript='{transcript}'")
+            return transcript
 
         finally:
             await self.stt.disconnect()
 
+    def _save_stt_debug_audio(self, attempt: int, chunks: list[bytes]) -> None:
+        """Save STT audio to WAV for debugging."""
+        os.makedirs(config.DEBUG_AUDIO_DIR, exist_ok=True)
+        pcm_data = b"".join(chunks)
+        path = os.path.join(config.DEBUG_AUDIO_DIR, f"stt_{attempt:03d}.wav")
+
+        num_frames = len(pcm_data) // (config.AUDIO_CHANNELS * config.AUDIO_FORMAT_WIDTH)
+        byte_rate = config.AUDIO_SAMPLE_RATE * config.AUDIO_CHANNELS * config.AUDIO_FORMAT_WIDTH
+        block_align = config.AUDIO_CHANNELS * config.AUDIO_FORMAT_WIDTH
+        data_size = len(pcm_data)
+
+        with open(path, "wb") as f:
+            f.write(b"RIFF")
+            f.write(struct.pack("<I", 36 + data_size))
+            f.write(b"WAVE")
+            f.write(b"fmt ")
+            f.write(struct.pack("<I", 16))
+            f.write(struct.pack("<H", 1))  # PCM
+            f.write(struct.pack("<H", config.AUDIO_CHANNELS))
+            f.write(struct.pack("<I", config.AUDIO_SAMPLE_RATE))
+            f.write(struct.pack("<I", byte_rate))
+            f.write(struct.pack("<H", block_align))
+            f.write(struct.pack("<H", 16))  # bits per sample
+            f.write(b"data")
+            f.write(struct.pack("<I", data_size))
+            f.write(pcm_data)
+
+        duration = num_frames / config.AUDIO_SAMPLE_RATE
+        logger.info(f"STT debug audio saved: {path} ({duration:.1f}s, {len(chunks)} chunks)")
+
     async def _generate_and_speak(self, user_input: str) -> None:
-        """Generate LLM response and synthesize speech with pipelined TTS.
-
-        Uses a producer/consumer pattern: the LLM streams sentences into an
-        asyncio.Queue while the consumer streams TTS audio chunks to the
-        output buffer.  This eliminates inter-sentence silence gaps.
-
-        Supports barge-in: both producer and consumer check _barge_in_event
-        each iteration and bail out early when set.
-        """
+        """Generate LLM response and synthesize speech with streaming."""
         await self.set_state(config.State.SPEAKING)
-
-        # Add current visual context as a conversation message
-        scene_description = self.vision.get_cached_description()
-        if scene_description and scene_description != "No visual information available.":
-            self.conversation.add_vision_message(scene_description)
-            await broadcast_conversation()
 
         # Get conversation history and system prompt
         messages = self.conversation.get_messages()
         system_prompt = get_system_prompt()
 
-        # Pipeline TTS — producer/consumer via asyncio.Queue
-        sentence_queue: asyncio.Queue[str | None] = asyncio.Queue()
-        spoken_sentences: list[str] = []
+        # Append vision context to system prompt (keeps conversation
+        # messages as clean user/assistant pairs)
+        scene_description = self.vision.get_cached_description()
+        if scene_description and scene_description != "No visual information available.":
+            system_prompt += (
+                f"\n\n[Current visual context — do not describe this aloud,"
+                f" use it to inform your responses] {scene_description}"
+            )
 
-        async def producer():
-            try:
-                async for sentence in self.llm.generate_sentences(messages, system_prompt):
-                    if self._barge_in_event.is_set():
-                        break
-                    await sentence_queue.put(sentence)
-            finally:
-                await sentence_queue.put(None)  # sentinel
+        # Stream response sentence by sentence
+        full_response = ""
 
-        async def consumer():
-            while not self._barge_in_event.is_set():
-                # Poll queue with timeout so we can check barge-in
-                try:
-                    sentence = await asyncio.wait_for(
-                        sentence_queue.get(), timeout=0.1
-                    )
-                except asyncio.TimeoutError:
-                    continue
+        async for sentence in self.llm.generate_sentences(messages, system_prompt):
+            full_response += sentence + " "
 
-                if sentence is None:
-                    break
+            # Synthesize and play this sentence
+            await self._synthesize_and_play(sentence)
 
-                spoken_sentences.append(sentence)
+        # Add assistant response to conversation
+        self.conversation.add_assistant_message(full_response.strip())
+        await broadcast_conversation()
 
-                try:
-                    async for audio_chunk in self.tts.synthesize_stream(sentence):
-                        if self._barge_in_event.is_set():
-                            break
-                        self.audio_output.write(audio_chunk)
-                except Exception as e:
-                    logger.error(f"TTS error: {e}")
-
-            # Wait for playback to drain (unless barged-in)
-            while self.audio_output.is_playing() and not self._barge_in_event.is_set():
-                await asyncio.sleep(0.05)
-
-        # Run producer and consumer concurrently
-        producer_task = asyncio.create_task(producer())
-        await consumer()
-
-        # Ensure producer is cleaned up
-        if not producer_task.done():
-            producer_task.cancel()
-            try:
-                await producer_task
-            except asyncio.CancelledError:
-                pass
-        else:
-            await producer_task  # propagate exceptions
-
-        # On barge-in, immediately silence HAL
-        if self._barge_in_event.is_set():
-            self.audio_output.clear_buffer()
-
-        # Record whatever was spoken
-        full_response = " ".join(spoken_sentences)
-        if full_response:
-            self.conversation.add_assistant_message(full_response.strip())
-            await broadcast_conversation()
-            self.transcript.log_hal_response(full_response.strip())
+        # Log HAL's response
+        self.transcript.log_hal_response(full_response.strip())
 
     async def _synthesize_and_play(self, text: str) -> None:
         """Synthesize text to speech and play it."""
@@ -390,7 +440,34 @@ class HALOrchestrator:
         """Speak a complete message."""
         await self.set_state(config.State.SPEAKING)
         await self._synthesize_and_play(text)
+        self._speaking_ended_at = time.time()
         await self.set_state(config.State.IDLE)
+
+    async def _initiate_proactive_conversation(self) -> None:
+        """Generate and speak a proactive conversation starter."""
+        if self._state != config.State.IDLE:
+            return
+
+        scene = self.vision.get_cached_description()
+        prompt = get_proactive_prompt(scene)
+
+        # Generate 10 questions, pick one at random
+        response = await self.llm.generate(
+            messages=[{"role": "user", "content": prompt}],
+        )
+        questions = _parse_questions(response)
+        if not questions:
+            logger.warning("Proactive conversation: failed to parse questions from LLM response")
+            return
+
+        question = random.choice(questions)
+        logger.info(f"Proactive conversation: \"{question}\"")
+
+        # Add to conversation and speak
+        self.conversation.add_assistant_message(question)
+        await broadcast_conversation()
+        self.transcript.log_hal_response(question)
+        await self._speak(question)
 
     async def _vision_loop(self) -> None:
         """Background task to update vision cache."""
@@ -405,6 +482,25 @@ class HALOrchestrator:
                 frame_base64 = await self.video.get_frame_base64_async()
                 if frame_base64:
                     await self.vision.update_cache(frame_base64)
+
+                # Check for person presence in vision description
+                description = self.vision.get_cached_description()
+                if description and _description_has_person(description):
+                    self._person_frames += 1
+                    logger.debug(f"Person detected, consecutive frames: {self._person_frames}")
+                else:
+                    self._person_frames = 0
+
+                # Trigger proactive conversation after 2+ consecutive frames (~30s)
+                if (
+                    self._person_frames >= 2
+                    and self._state == config.State.IDLE
+                    and time.time() - self._last_proactive_at >= 120
+                ):
+                    logger.info("Person sustained presence detected — initiating proactive conversation")
+                    self._person_frames = 0
+                    self._last_proactive_at = time.time()
+                    await self._initiate_proactive_conversation()
 
             except Exception as e:
                 logger.error(f"Vision loop error: {e}")

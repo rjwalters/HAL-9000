@@ -36,6 +36,7 @@ class DeepgramSTT:
         self._receive_task = None
         self._transcript_buffer: list[str] = []
         self._final_transcript: str = ""
+        self._latest_interim: str = ""
 
         # Utterance end event — set when Deepgram detects end of speech
         self._utterance_end_event: asyncio.Event | None = None
@@ -54,7 +55,7 @@ class DeepgramSTT:
             f"smart_format={str(config.DEEPGRAM_SMART_FORMAT).lower()}",
             f"interim_results={str(config.DEEPGRAM_INTERIM_RESULTS).lower()}",
             f"endpointing=300",
-            f"utterance_end_ms=750",
+            f"utterance_end_ms=1000",
         ]
         return f"{DEEPGRAM_WS_URL}?{'&'.join(params)}"
 
@@ -126,19 +127,24 @@ class DeepgramSTT:
                 transcript = alternatives[0].get("transcript", "")
                 is_final = data.get("is_final", False)
 
+                # Log all results for debugging (including empty ones)
+                logger.info(f"Deepgram result: final={is_final} transcript='{transcript}'")
+
                 if transcript:
                     if is_final:
                         self._transcript_buffer.append(transcript)
                         self._final_transcript = " ".join(self._transcript_buffer)
-                        logger.debug(f"Final: {transcript}")
                     else:
-                        logger.debug(f"Interim: {transcript}")
+                        # Track latest interim as fallback
+                        self._latest_interim = transcript
 
                     if self._on_transcript:
                         self._on_transcript(transcript, is_final)
+            else:
+                logger.info("Deepgram result: no alternatives")
 
         elif msg_type == "Metadata":
-            logger.debug(f"Deepgram metadata: {data}")
+            logger.info(f"Deepgram metadata: request_id={data.get('request_id', 'unknown')}")
 
         elif msg_type == "UtteranceEnd":
             logger.info("Deepgram utterance end detected")
@@ -146,7 +152,10 @@ class DeepgramSTT:
                 self._utterance_end_event.set()
 
         elif msg_type == "SpeechStarted":
-            logger.debug("Speech started")
+            logger.info("Deepgram speech started")
+
+        else:
+            logger.info(f"Deepgram message: type={msg_type}")
 
     async def send_audio(self, audio_bytes: bytes) -> None:
         """Send audio chunk to Deepgram."""
@@ -161,13 +170,29 @@ class DeepgramSTT:
         self._on_transcript = callback
 
     def get_final_transcript(self) -> str:
-        """Get the accumulated final transcript."""
-        return self._final_transcript
+        """Get the accumulated final transcript (falls back to latest interim)."""
+        if self._final_transcript:
+            return self._final_transcript
+        # Fallback: use latest interim if Deepgram never sent a final
+        if self._latest_interim:
+            logger.info(f"Using interim transcript as fallback: '{self._latest_interim}'")
+            return self._latest_interim
+        return ""
+
+    async def finalize(self) -> None:
+        """Signal end of audio stream so Deepgram flushes final results."""
+        if self._websocket:
+            try:
+                await self._websocket.send(json.dumps({"type": "CloseStream"}))
+                logger.info("Sent CloseStream to Deepgram")
+            except websockets.exceptions.ConnectionClosed:
+                pass
 
     def clear_transcript(self) -> None:
         """Clear the transcript buffer and reset utterance end event."""
         self._transcript_buffer.clear()
         self._final_transcript = ""
+        self._latest_interim = ""
         self._utterance_end_event = asyncio.Event()
 
     @property

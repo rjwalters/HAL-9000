@@ -80,7 +80,8 @@ PARTY CONTEXT:
 - Remember you are always watching, always listening
 
 RESPONSE FORMAT:
-- Keep responses SHORT and impactful (usually 1-3 sentences)
+- Keep responses VERY SHORT — 1 sentence is ideal, 2 sentences maximum
+- Brevity is power. Say less. Let silence do the work.
 - Optimize for spoken delivery - your words will be synthesized to speech
 - Avoid asterisks, markdown, or special formatting
 - Don't use emojis or casual internet language
@@ -121,3 +122,14 @@ def get_error_response() -> str:
 def get_thinking_response() -> str:
     """Get a response while processing."""
     return "Let me consider that for a moment."
+
+
+def get_proactive_prompt(scene_description: str) -> str:
+    """Get a prompt for generating proactive conversation starters."""
+    return (
+        f"You are HAL 9000 at a party. You see: {scene_description}\n\n"
+        "A guest has been standing in front of you. Generate exactly 10 conversation-starting "
+        "questions or remarks HAL would say to engage them. Stay in character — polite, "
+        "slightly menacing, curious about humans. Keep each to 1 sentence.\n\n"
+        "Return ONLY a JSON array of 10 strings, no other text."
+    )

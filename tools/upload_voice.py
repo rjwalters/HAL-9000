@@ -2,9 +2,9 @@
 """Upload HAL voice samples to ElevenLabs as an Instant Voice Clone.
 
 Sources:
-  - hal_samples/trimmed/          denoised dialogue clips from 2001: A Space Odyssey
-  - hal_samples/narration_clips/  isolated vocal clips from the 1960 NFB
-    documentary "Universe" (produced by tools/isolate_narration.py)
+  - hal_samples/trimmed/               denoised dialogue clips from 2001: A Space Odyssey
+  - hal_samples/narration_scored/good/  quality-filtered narration clips from the 1960
+    NFB documentary "Universe" (produced by tools/score_narration.py)
 
 All sources are concatenated with silence gaps and split into <=10 MB chunks
 before uploading.
@@ -22,7 +22,7 @@ from elevenlabs import ElevenLabs
 
 HAL_SAMPLES = Path(__file__).resolve().parent.parent / "hal_samples"
 TRIMMED_DIR = HAL_SAMPLES / "trimmed"
-NARRATION_DIR = HAL_SAMPLES / "narration_clips"
+NARRATION_DIR = HAL_SAMPLES / "narration_scored" / "good"
 SILENCE_GAP_SECS = 2
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB to stay under 11 MB limit
 # WAV at 44100 Hz mono 16-bit ≈ 88200 bytes/sec

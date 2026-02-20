@@ -48,6 +48,8 @@ class AudioOutput:
         # Fade-in state to avoid click on speech start
         self._needs_fadein = True
         self._fadein_samples = 256  # ~10ms at 24kHz
+        # Silent lead-in to let macOS wake the speaker DAC
+        self._wakeup_silence = b"\x00" * (sample_rate * channels * 2 // 5)  # 200ms
 
         # Debug audio dump
         self._debug_chunks: list[bytes] = []
@@ -197,6 +199,8 @@ class AudioOutput:
         """Write audio data to playback buffer."""
         with self._buffer_lock:
             if self._needs_fadein:
+                # Prepend silence so macOS speaker DAC wakes before real audio
+                self._buffer.append(self._wakeup_silence)
                 data = self._apply_fadein(data)
                 self._needs_fadein = False
             self._buffer.append(data)

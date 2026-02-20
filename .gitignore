@@ -47,6 +47,7 @@ hal_samples/manifest.json
 # Narration isolation intermediates
 hal_samples/separated/
 hal_samples/narration_clips/
+hal_samples/narration_scored/
 
 # Logs
 *.log

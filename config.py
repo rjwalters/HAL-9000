@@ -23,25 +23,27 @@ AUDIO_SAMPLE_RATE = 16000  # Hz - standard for speech recognition
 AUDIO_CHANNELS = 1  # Mono
 AUDIO_CHUNK_SIZE = 512  # Samples per chunk (~32ms at 16kHz)
 AUDIO_FORMAT_WIDTH = 2  # 16-bit audio (2 bytes)
+AUDIO_INPUT_DEVICE = 1  # HD Pro Webcam C920 mic
 
 # Playback configuration (ElevenLabs outputs 24kHz by default)
 PLAYBACK_SAMPLE_RATE = 24000
 PLAYBACK_CHANNELS = 1
 PLAYBACK_CHUNK_SIZE = 1024
+PLAYBACK_OUTPUT_DEVICE = 2  # External Headphones
 
 # =============================================================================
 # VAD (Voice Activity Detection) Configuration
 # =============================================================================
 VAD_THRESHOLD = 0.5  # Speech probability threshold (0-1)
 VAD_MIN_SPEECH_MS = 250  # Minimum speech duration to trigger
-VAD_MIN_SILENCE_MS = 500  # Silence duration to mark end-of-speech
+VAD_MIN_SILENCE_MS = 700  # Silence duration to mark end-of-speech
 VAD_WINDOW_SIZE_MS = 32  # VAD analysis window
 VAD_MAX_RECORDING_SECS = 60  # Hard cap on recording duration
 
 # =============================================================================
 # Video Configuration
 # =============================================================================
-VIDEO_DEVICE_ID = 0  # Default webcam
+VIDEO_DEVICE_ID = 1  # HD Pro Webcam C920
 VIDEO_FRAME_WIDTH = 640
 VIDEO_FRAME_HEIGHT = 480
 VIDEO_FPS = 30
